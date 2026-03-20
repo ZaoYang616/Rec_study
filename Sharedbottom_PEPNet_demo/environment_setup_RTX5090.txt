@@ -1,0 +1,43 @@
+=========================================================
+ShareBottom_PEPNet - RTX 5090 (Blackwell) 环境配置指南
+=========================================================
+
+为了顺利在 RTX 5090 (底层架构 sm_120) 等最新一代显卡上运行通过本项目的模型，
+并且避免 `CUDA error: no kernel image is available for execution` 报错，
+本项目必须依赖较新的 Python 以及配合新版 CUDA 编译的 PyTorch 预览版。
+
+基础要求：
+- Python 版本：3.10
+
+---------------------------------------------------------
+👉 【一键配置命令】
+---------------------------------------------------------
+
+1. 创建并激活基础环境
+conda create -n pepnet_env python=3.10 -y
+conda activate pepnet_env
+
+2. 安装 PyTorch 核心组件 (关键：指定 cu128 与 --pre 下载预览版)
+pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+
+3. 安装数据处理与可视化、Notebook支持环境
+pip install pandas pyarrow scikit-learn matplotlib ipykernel
+
+4. (可选) 将新环境注册到 Jupyter Notebook 供页面选择
+python -m ipykernel install --user --name pepnet_env --display-name "Python 3.10 (PEPNet RTX5090)"
+
+
+---------------------------------------------------------
+📌 【已知成功通关的包版本快照 (用于精确复现)】
+---------------------------------------------------------
+如果你在未来复现时发现 API 变更或者环境冲突，可以严格锁定以下我们验证通过的版本：
+
+python == 3.10.20
+torch == 2.12.0.dev20260317+cu128
+torchvision == 0.26.0.dev20260317+cu128
+torchaudio == 2.11.0.dev20260317+cu128
+pandas == 2.3.3
+pyarrow == 23.0.1
+scikit-learn == 1.7.2
+matplotlib == 3.10.8
+ipykernel == 7.2.0
