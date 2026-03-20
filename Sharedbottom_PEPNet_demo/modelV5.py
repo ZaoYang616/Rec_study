@@ -2,47 +2,10 @@ import torch
 import torch.nn as nn
 import json
 
-'''
-ShareBottom_PEPNet (主模型)
-│
-├── 1. embedding_layer: MultiHotEmbeddingSum
-│      └── embedding: nn.Embedding(num_embeddings=V, embedding_dim=16, padding_idx=0)
-│
-├── 2. epnet: EPNet (处理场景与物料)
-│      └── gate_nu: GateNU 
-│             └── net: nn.Sequential (Linear -> ReLU -> Linear -> Sigmoid)
-│
-├── 3. shared_bottom: nn.Sequential (点击塔特征提取)
-│      ├── 0: nn.Linear(in=16, out=256)
-│      ├── 1: nn.ReLU()
-│      ├── 2: nn.Linear(in=256, out=128)
-│      └── 3: nn.ReLU()
-│
-├── 4. click_head: nn.Sequential (点击塔输出)
-│      ├── 0: nn.Linear(in=128, out=1)
-│      └── 1: nn.Sigmoid()
-│
-├── 5. gate_nn: GateNU (桥接门控，控制流向转化塔的特征)
-│      └── net: nn.Sequential (Linear -> ReLU -> Linear -> Sigmoid)
-│
-└── 6. cvr_tower: PPNetTower (转化塔)
-       ├── layers: nn.ModuleList
-       │      ├── 0: PPNetLayer (第一层个性化微调)
-       │      │      ├── linear: nn.Linear(in=128, out=128)
-       │      │      └── gate: GateNU (专属门控)
-       │      │
-       │      └── 1: PPNetLayer (第二层个性化微调)
-       │             ├── linear: nn.Linear(in=128, out=64)
-       │             └── gate: GateNU (专属门控)
-       │
-       └── final_proj: nn.Linear(in=64, out=1)
-       (外接 cvr_act: nn.Sigmoid())
-'''
-
 class GateNU(nn.Module):  #门控组件
     """
     两层门控网络（NU）：用于为专家或特征动态生成缩放系数。
-    结构：Linear(ReLU) -> Linear(Sigmoid) -> Gamma 缩放
+    结构：Linear(ReLU) -> Linear(Sigmoid) -> Gamma 缩放（2.0）
     """
     def __init__(self, in_features, hidden_units, gamma=2.0): #接收三个参数：输入维度 in_features，隐藏层维度列表 hidden_units，以及放大系数 gamma（默认 2.0）。
         super(GateNU, self).__init__() #调用父类的初始化方法，注册模型参数。
@@ -131,6 +94,7 @@ class AFMLayer(nn.Module):
 class DINAttentionLayer(nn.Module):
     """
     基于阿里 Deep Interest Network (DIN) 的目标注意力机制层
+    去除用户行为特征的噪音，增强与目标商品的相关兴趣表达
     """
     def __init__(self, embed_dim=32, hidden_units=[64, 32]):
         super(DINAttentionLayer, self).__init__()
@@ -203,7 +167,7 @@ class PPNetLayer(nn.Module): #带个性化门控的单层网络
 
 class PPNetTower(nn.Module):
     """
-    由多层 PPNetLayer 构成的任务塔（比如 CVR 塔）
+    由多层 PPNetLayer 构成的 CVR 塔
     """
     def __init__(self, in_features, persona_dim, hidden_units=[128, 64], dropout=0.0):
         super(PPNetTower, self).__init__()
@@ -226,6 +190,9 @@ class PPNetTower(nn.Module):
         return self.final_proj(x)
 
 class MultiHotEmbeddingSum(nn.Module):
+    '''
+    处理多值特征的 Embedding 层：对于输入的多值特征索引，先通过 nn.Embedding 得到对应的嵌入向量，然后在特征维度上进行求和，得到一个固定维度的向量表示。
+    '''
     def __init__(self, vocab_json_path, embed_dim=16):
         super().__init__()
         with open(vocab_json_path, "r") as f:
@@ -234,16 +201,26 @@ class MultiHotEmbeddingSum(nn.Module):
         total_vocab_size = sum(vocab_sizes.values()) + max(vocab_sizes.values())
         self.embedding = nn.Embedding(num_embeddings=total_vocab_size, embedding_dim=embed_dim, padding_idx=0)
         
-        # 💡 新增：加入 LayerNorm 稳定数值分布
+        # 加入 LayerNorm 稳定数值分布
         self.norm = nn.LayerNorm(embed_dim)
         
     def forward(self, x_idx):
         emb = self.embedding(x_idx)
         sum_emb = emb.sum(dim=1)
-        # 💡 新增：对相加后的特征进行归一化
+        # 对相加后的特征进行归一化
         return self.norm(sum_emb)
 
 class ShareBottom_PEPNet(nn.Module):
+    '''
+    ShareBottom_PEPNet 模型：集成了 EPNet 场景个性化、AFM 交叉层、DIN 注意力机制，以及 PPNet 个性化塔的 CTR/CVR 联合预测模型。
+    1. 输入层：使用 MultiHotEmbeddingSum 处理多值特征，得到场景、物品、用户画像等基础嵌入。
+    2. EPNet 模块：利用场景特征对物品特征进行门控缩放，生成个性化的 Target Item 表征。
+    3. DIN 注意力层：让 Target Item 去检索用户历史行为序列，计算兴趣加权表示，增强用户兴趣表达的相关性和区分度。
+    4. AFM 交叉层：自动学习不同特征域之间的交叉特征的重要性，生成一个全局的交叉特征表示。
+    5. 共享底层 MLP：将基础特征和 AFM 输出拼接后输入一个共享的 MLP，提取通用特征表示。
+    6. CTR 头：共享底层的输出经过一个简单的线性层和 Sigmoid 激活，预测点击概率。
+    7. CVR 个性化塔：使用 PPNetTower，输入共享底层的输出和用户画像，经过多层个性化门控网络，最终输出转化概率。 
+    '''
     def __init__(self, vocab_json_path, embed_dim=32, 
                  shared_bottom_units=[256, 128], 
                  cvr_tower_units=[128, 64],
@@ -254,12 +231,11 @@ class ShareBottom_PEPNet(nn.Module):
         self.embedding_layer = MultiHotEmbeddingSum(vocab_json_path, embed_dim)
         self.epnet = EPNet(domain_dim=embed_dim, emb_dim=embed_dim)
         self.afm = AFMLayer(embed_dim=embed_dim, attention_factor=16, num_fields=4)
-        
-        # 💡 新增: 实例化 DIN 注意力机制层
         self.din_attention = DINAttentionLayer(embed_dim=embed_dim)
         
-        mlp_in_dim = embed_dim * 5
-        
+
+        #CTR塔
+        mlp_in_dim = embed_dim * 5  # 场景、物品、画像、行为、AFM 输出各 embed_dim 维度拼接
         self.shared_bottom = nn.Sequential(
             nn.Linear(mlp_in_dim, shared_bottom_units[0]),
             nn.ReLU(),
@@ -273,7 +249,8 @@ class ShareBottom_PEPNet(nn.Module):
             nn.Sigmoid()
         )
         
-        persona_dim = embed_dim * 2 
+        #CVR塔
+        persona_dim = embed_dim * 2  #用户行为和用户画像拼接成 persona_emb，维度是 embed_dim 的两倍
         self.gate_nn = GateNU(in_features=persona_dim, 
                               hidden_units=[shared_bottom_units[1], shared_bottom_units[1]])
         self.cvr_tower = PPNetTower(in_features=shared_bottom_units[1], 
@@ -283,7 +260,7 @@ class ShareBottom_PEPNet(nn.Module):
         self.cvr_act = nn.Sigmoid()
 
     def forward(self, batch):
-        # 1. 提取基础特征 (此时 item_emb 已经被暴力相加，没关系，作为 Target 是合理的)
+        # 提取基础特征 (此时 item_emb 已经被暴力相加，没关系，作为 Target 是合理的)
         scene_emb = self.embedding_layer(batch['epnet_scene_idx'])
         item_emb = self.embedding_layer(batch['item_and_cross_idx'])
         profile_emb = self.embedding_layer(batch['user_profile_idx'])
@@ -291,35 +268,30 @@ class ShareBottom_PEPNet(nn.Module):
         # 场景对物品进行门控缩放，生成最终的 Target Item
         patched_item_emb = self.epnet(scene_emb, item_emb)
         
-        # 💡 核心改动开始 ==========================================
         # 提取用户历史行为的“原始序列”，不要直接调用 embedding_layer 导致它被暴力 Sum 掉
         # 提取出来的形状是 [Batch, 50, EmbedDim] (假设序列长度是50)
         behavior_seq = self.embedding_layer.embedding(batch['user_behavior_idx'])
-        
         # 生成 Mask (判断序列里哪些位置是大于 0 的真实商品ID，哪些是 0 的占位符)
         # 形状转为 [Batch, 50, 1]
         seq_mask = (batch['user_behavior_idx'] > 0).float().unsqueeze(-1)
-        
-        # 真正的高级操作：让 Target Item 去检索用户行为序列，计算 Attention
+        # 让 Target Item 去检索用户行为序列，计算 Attention
         behavior_emb = self.din_attention(query=patched_item_emb, keys=behavior_seq, mask=seq_mask)
-        
         # 为了防止加权求和后数值过大，仍然使用底层的 LayerNorm 稳定一下分布
         behavior_emb = self.embedding_layer.norm(behavior_emb)
-        # 💡 核心改动结束 ==========================================
         
-        # 下面的流程和以前一模一样，但此时的 behavior_emb 已经是拥有灵魂的动态向量了
+        # AFM 交叉层：输入场景、物品、画像、行为四大类特征的 Embedding，自动学习两两交叉的重要性，输出一个全局的交叉特征表示
         emb_list = [scene_emb, patched_item_emb, profile_emb, behavior_emb]
         afm_out = self.afm(emb_list)
         
+        # CTR 塔的输入是基础特征和 AFM 输出的拼接，提取共享底层特征表示
         ctr_mlp_in = torch.cat([scene_emb, patched_item_emb, profile_emb, behavior_emb, afm_out], dim=-1)
+        shared_hidden = self.shared_bottom(ctr_mlp_in) # 共享底层 MLP 提取通用特征表示
+        click_prob = self.click_head(shared_hidden).squeeze(-1)  # CTR 头预测点击概率
         
-        shared_hidden = self.shared_bottom(ctr_mlp_in)
-        click_prob = self.click_head(shared_hidden).squeeze(-1) 
-        
+        # CVR 塔的输入是共享底层的输出和用户画像的拼接，经过多层个性化门控网络，最终输出转化概率。这里的门控机制让 CVR 塔能够根据用户画像动态调整特征处理方式，实现真正的个性化。
         persona_emb = torch.cat([profile_emb, behavior_emb], dim=-1)
-        
-        cvr_shared_hidden = self.gate_nn(persona_emb) * shared_hidden.detach() 
-        cvr_logit = self.cvr_tower(cvr_shared_hidden, persona_emb)
-        cvr_prob = self.cvr_act(cvr_logit).squeeze(-1)
+        cvr_shared_hidden = self.gate_nn(persona_emb) * shared_hidden.detach() #门控机制：用用户画像计算出一个缩放系数，对共享底层的输出进行调整。detach() 截断梯度，确保 CVR 的个性化调整不会反向传播干扰共享底层的训练。
+        cvr_logit = self.cvr_tower(cvr_shared_hidden, persona_emb) #将调整后的特征和用户画像一起输入 PPNetTower，经过多层个性化门控网络，输出 CVR 的 Logit 分数。
+        cvr_prob = self.cvr_act(cvr_logit).squeeze(-1) #最后通过 Sigmoid 激活函数将 Logit 转化为概率值，输出 CVR 预测结果。
         
         return click_prob, cvr_prob
